@@ -1,0 +1,50 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Microservices Catalogue Application
+# ─────────────────────────────────────────────────────────────────────────────
+# Start everything:   docker compose up --build
+# Stop everything:    docker compose down
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Catalogue Service ──────────────────────────────────────────────────────
+  catalogue-service:
+    build:
+      context: ./catalogue-service
+      dockerfile: Dockerfile
+    image: catalogue-service:latest
+    container_name: catalogue-service
+    ports:
+      - "8080:8080"       # host:container
+    networks:
+      - app-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/catalogue/items || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Booking Service ────────────────────────────────────────────────────────
+  booking-service:
+    build:
+      context: ./booking-service
+      dockerfile: Dockerfile
+    image: booking-service:latest
+    container_name: booking-service
+    ports:
+      - "8081:8081"       # host:container
+    environment:
+      # Docker service name resolves inside the app-net bridge network.
+      # This overrides the localhost default in application.properties.
+      CATALOGUE_SERVICE_URL: http://catalogue-service:8080
+    depends_on:
+      catalogue-service:
+        condition: service_healthy   # wait for catalogue to be ready
+    networks:
+      - app-net
+
+# ── Shared bridge network ──────────────────────────────────────────────────
+networks:
+  app-net:
+    driver: bridge

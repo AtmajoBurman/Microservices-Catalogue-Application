@@ -1,0 +1,28 @@
+# Maven build output
+target/
+
+# Compiled class files
+*.class
+
+# JAR files
+*.jar
+*.jar.original
+
+# Log files
+*.log
+
+# macOS
+.DS_Store
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+
+# VS Code
+.vscode/
+
+# Eclipse
+.classpath
+.project
+.settings/
