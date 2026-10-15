@@ -1,103 +1,102 @@
-# Microservices Catalogue Application — Architecture Overview
+# Microservices Catalogue Application: Architecture Overview
 
-> **Stack:** Java 17 · Spring Boot 3.2.5 · Maven · Docker · Docker Compose  
-> **Transport:** HTTP/REST over an isolated Docker bridge network (`app-net`)  
-> **Storage:** In-memory `ConcurrentHashMap` — no external database
-
----
+| | |
+|---|---|
+| **Stack** | Java 17 · Spring Boot 3.2.5 · Maven · Docker · Docker Compose |
+| **Transport** | Synchronous HTTP/REST over an isolated Docker bridge network (`app-net`) |
+| **Storage** | In-memory `ConcurrentHashMap` (no external database) |
+| **Last reviewed** | 2026-10-16 |
 
 ## Table of Contents
 
 1. [System Context](#1-system-context)
-2. [Container / Deployment View](#2-container--deployment-view)
+2. [Container and Deployment View](#2-container-and-deployment-view)
 3. [Internal Component View](#3-internal-component-view)
-4. [API Surface Map](#4-api-surface-map)
+4. [API Reference](#4-api-reference)
 5. [Startup Sequence](#5-startup-sequence)
 6. [Workflow Walkthroughs](#6-workflow-walkthroughs)
-   - [Scenario A — Successful Booking](#scenario-a--successful-booking)
-   - [Scenario B — Booking Fails (Stock Exceeded)](#scenario-b--booking-fails-stock-exceeded)
-7. [Concurrency & Thread-Safety Model](#7-concurrency--thread-safety-model)
+7. [Concurrency and Thread-Safety Model](#7-concurrency-and-thread-safety-model)
 8. [Docker Build Pipeline](#8-docker-build-pipeline)
-9. [Design Decisions & Trade-offs](#9-design-decisions--trade-offs)
+9. [Design Decisions and Trade-offs](#9-design-decisions-and-trade-offs)
+10. [Known Limitations and Next Steps](#10-known-limitations-and-next-steps)
 
 ---
 
 ## 1. System Context
 
-The highest-level view shows who interacts with the system and how.
+Two services, one external client type. The Booking Service is the only one that
+contains business logic; the Catalogue Service owns the data and is the final
+authority on stock integrity.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│                        External Boundary                           │
-│                                                                    │
-│   ┌──────────┐    HTTP :8081     ┌──────────────────────────────┐  │
-│   │          │ ─────────────────▶│                              │  │
-│   │  Client  │                   │  Microservices Catalogue App │  │
-│   │ (Browser │ ◀─────────────────│  (Docker Compose stack)      │  │
-│   │ / curl / │    JSON / text    │                              │  │
-│   │ Postman) │                   └──────────────────────────────┘  │
-│   │          │    HTTP :8080     ┌──────────────────────────────┐  │
-│   │          │ ─────────────────▶│  Catalogue Service (public   │  │
-│   │          │ ◀─────────────────│  read-only endpoint)         │  │
-│   └──────────┘    JSON array     └──────────────────────────────┘  │
-└────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    client["Client<br/>(browser / curl / Postman)"]
+
+    subgraph stack["Docker Compose stack"]
+        booking["Booking Service<br/>host port 8081"]
+        catalogue["Catalogue Service<br/>host port 8080"]
+    end
+
+    client -->|"POST /booking"| booking
+    client -->|"GET /catalogue/items"| catalogue
+    booking -->|"GET item<br/>PUT reduce"| catalogue
 ```
 
-| Actor | Role |
+| Actor | Responsibility |
 |---|---|
-| **Client** | Any HTTP client — browser, curl, Postman, or another service |
-| **Booking Service** | Orchestrates booking logic; calls Catalogue Service internally |
-| **Catalogue Service** | Owns the item catalogue; enforces stock integrity |
+| **Client** | Any HTTP client: browser, curl, Postman, or another service |
+| **Booking Service** | Validates requests and orchestrates the booking; calls the Catalogue Service |
+| **Catalogue Service** | Owns the item catalogue and enforces stock integrity |
+
+> **Note:** Both ports are published to the host in the default Compose file, which
+> means the internal `PUT /reduce` endpoint is also reachable by external clients.
+> See [Section 10](#10-known-limitations-and-next-steps).
 
 ---
 
-## 2. Container / Deployment View
+## 2. Container and Deployment View
 
-Both services run as separate Docker containers inside a shared bridge network.
+Each service runs in its own container on a shared user-defined bridge network.
+Docker's embedded DNS resolves `catalogue-service` to the container IP.
 
-```
-╔═══════════════════════════════════════════════════════════════════════════════╗
-║  Docker Host                                                                  ║
-║                                                                               ║
-║  ┌───────────────────────────────────────────────────────────────────────┐    ║
-║  │  Network: app-net  (Docker bridge, internal DNS enabled)              │    ║
-║  │                                                                       │    ║
-║  │  ┌─────────────────────────────┐    ┌─────────────────────────────┐   │    ║
-║  │  │  booking-service            │    │  catalogue-service          │   │    ║
-║  │  │  Image: booking-service:    │    │  Image: catalogue-service:  │   │    ║
-║  │  │         latest              │    │         latest              │   │    ║
-║  │  │  Port:  8081 (container)    │    │  Port:  8080 (container)    │   │    ║
-║  │  │                             │    │                             │   │    ║
-║  │  │  Spring Boot app            │    │  Spring Boot app            │   │    ║
-║  │  │  ├── BookingController      │    │  ├── ItemController         │   │    ║
-║  │  │  ├── AppConfig (RestTemplate│    │  ├── ItemRepository         │   │    ║
-║  │  │  ├── BookingRequest (DTO)   │    │  │   └── ConcurrentHashMap  │   │    ║
-║  │  │  └── CatalogueItem  (DTO)   │    │  └── Item (model)           │   │    ║
-║  │  │                             │    │                             │   │    ║
-║  │  │  ENV: CATALOGUE_SERVICE_URL │───▶│  Health: GET /catalogue/    │   │    ║
-║  │  │  = http://catalogue-service │    │          items (10s probe)  │   │    ║
-║  │  │    :8080                    │    │                             │   │    ║
-║  │  └─────────────────────────────┘    └─────────────────────────────┘   │    ║
-║  │         │   Internal REST calls over app-net   ▲                      │    ║
-║  │         └────────────────────────────────────── ┘                     │    ║
-║  └───────────────────────────────────────────────────────────────────────┘    ║
-║                                                                               ║
-║  Host port mapping:                                                           ║
-║    0.0.0.0:8081  ──▶  booking-service:8081                                    ║
-║    0.0.0.0:8080  ──▶  catalogue-service:8080                                  ║
-╚═══════════════════════════════════════════════════════════════════════════════╝
+```mermaid
+flowchart TB
+    host(["Host machine<br/>0.0.0.0:8080 and 0.0.0.0:8081"])
+
+    subgraph docker["Docker Host"]
+        subgraph net["Network: app-net (bridge, internal DNS)"]
+            direction LR
+            subgraph b["Container: booking-service (port 8081)"]
+                direction TB
+                bc["BookingController"]
+                cfg["AppConfig<br/>(RestTemplate bean)"]
+                dto["DTOs: BookingRequest, CatalogueItem"]
+            end
+            subgraph c["Container: catalogue-service (port 8080)"]
+                direction TB
+                ic["ItemController"]
+                repo["ItemRepository<br/>(ConcurrentHashMap)"]
+                model["Item model"]
+            end
+            b -->|"HTTP via http://catalogue-service:8080<br/>(CATALOGUE_SERVICE_URL)"| c
+        end
+    end
+
+    host -->|"8081"| b
+    host -->|"8080"| c
 ```
 
-### Inter-service Communication
+### Inter-service communication
 
-```
-booking-service  ──[GET  /catalogue/items/{id}]────────────────────▶  catalogue-service
-booking-service  ──[PUT  /catalogue/items/{id}/reduce?quantity=N]──▶  catalogue-service
-```
+| From | Call | Purpose |
+|---|---|---|
+| booking-service | `GET /catalogue/items/{id}` | Existence check and current stock |
+| booking-service | `PUT /catalogue/items/{id}/reduce?quantity=N` | Atomic stock deduction |
 
-- **Protocol:** Plain HTTP — traffic never leaves Docker's virtual `app-net` network
-- **Service Discovery:** Docker DNS — the name `catalogue-service` resolves automatically to the container IP
-- **HTTP Client:** Spring's `RestTemplate`, registered as a singleton `@Bean` in `AppConfig`
+- **Protocol:** plain HTTP; inter-service traffic stays on the virtual `app-net` network.
+- **Service discovery:** Docker DNS. The base URL is injected through the
+  `CATALOGUE_SERVICE_URL` environment variable (`http://catalogue-service:8080`).
+- **HTTP client:** Spring `RestTemplate`, registered as a singleton `@Bean` in `AppConfig`.
 
 ---
 
@@ -105,284 +104,344 @@ booking-service  ──[PUT  /catalogue/items/{id}/reduce?quantity=N]──▶  
 
 ### 3.1 Catalogue Service
 
-```
-com.catalogue
-│
-├── CatalogueServiceApplication.java   ← @SpringBootApplication entry point
-│
-├── controller/
-│   └── ItemController.java            ← @RestController  /catalogue/items/**
-│         │
-│         │  delegates to
-│         ▼
-├── repository/
-│   └── ItemRepository.java            ← @Repository
-│         │  Data store: ConcurrentHashMap<String, Item>
-│         │  Seed:       ITEM001 · ITEM002 · ITEM003
-│         │
-│         │  Read  → ConcurrentHashMap.get()        (non-blocking)
-│         │  Write → synchronized(item) { check + deduct }  (atomic)
-│         ▼
-└── model/
-    └── Item.java                      ← Plain domain object
-          Fields: itemId, name, price, availableCount
+```mermaid
+flowchart TB
+    app["CatalogueServiceApplication<br/>@SpringBootApplication"]
+    ctrl["controller.ItemController<br/>@RestController /catalogue/items/**"]
+    repo["repository.ItemRepository<br/>@Repository"]
+    store[("ConcurrentHashMap&lt;String, Item&gt;<br/>seeded: ITEM001, ITEM002, ITEM003")]
+    model["model.Item"]
+
+    app --> ctrl
+    ctrl -->|"delegates"| repo
+    repo -->|"reads: get() non-blocking<br/>writes: synchronized(item)"| store
+    store --- model
 ```
 
 ### 3.2 Booking Service
 
+```mermaid
+flowchart TB
+    app["BookingServiceApplication<br/>@SpringBootApplication"]
+    cfg["config.AppConfig<br/>produces RestTemplate bean<br/>reads CATALOGUE_SERVICE_URL"]
+    ctrl["controller.BookingController<br/>@RestController POST /booking"]
+    req["dto.BookingRequest<br/>{ itemId, quantity }"]
+    item["dto.CatalogueItem<br/>(Catalogue response)"]
+
+    app --> cfg
+    app --> ctrl
+    cfg -->|"injects RestTemplate"| ctrl
+    ctrl --> req
+    ctrl --> item
 ```
-com.booking
-│
-├── BookingServiceApplication.java     ← @SpringBootApplication entry point
-│
-├── config/
-│   └── AppConfig.java                 ← Produces RestTemplate @Bean
-│         │                              Reads CATALOGUE_SERVICE_URL from env
-│         ▼
-├── controller/
-│   └── BookingController.java         ← @RestController  POST /booking
-│         │
-│         │  Step 1: Validate input   (itemId not blank, quantity > 0)
-│         │  Step 2: GET  /catalogue/items/{id}    → existence check
-│         │  Step 3: Compare quantity vs availableCount
-│         │  Step 4: PUT  /catalogue/items/{id}/reduce?quantity=N
-│         ▼
-└── dto/
-    ├── BookingRequest.java            ← Deserialises POST body { itemId, quantity }
-    └── CatalogueItem.java             ← Deserialises Catalogue Service response
+
+### 3.3 Domain model
+
+```mermaid
+classDiagram
+    class Item {
+        +String itemId
+        +String name
+        +price
+        +int availableCount
+    }
+    class BookingRequest {
+        +String itemId
+        +int quantity
+    }
+    class CatalogueItem {
+        +String itemId
+        +String name
+        +price
+        +int availableCount
+    }
+    BookingRequest ..> Item : refers to by itemId
+    CatalogueItem ..> Item : mirrors (JSON)
+```
+
+`CatalogueItem` is the Booking Service's own copy of the Catalogue's response
+shape. The two services share no code, only the JSON contract.
+
+### 3.4 Booking decision logic
+
+`BookingController` runs four steps. Steps 1 to 3 are cheap guards; step 4 is the
+only one that mutates state.
+
+```mermaid
+flowchart TD
+    start(["POST /booking"]) --> v{"itemId not blank<br/>and quantity > 0?"}
+    v -- "no" --> e400a["400 Bad Request"]
+    v -- "yes" --> get["GET /catalogue/items/{id}"]
+    get --> f{"Item found?"}
+    f -- "no (404)" --> e404["404 'item not found'"]
+    f -- "yes" --> s{"quantity ≤ availableCount?"}
+    s -- "no" --> e400b["400 'number of items exceeded'"]
+    s -- "yes" --> put["PUT /catalogue/items/{id}/reduce?quantity=N"]
+    put --> r{"Reduce succeeded?"}
+    r -- "yes (200)" --> ok["200 'item booked'"]
+    r -- "no (400, concurrent drain)" --> e400b
 ```
 
 ---
 
-## 4. API Surface Map
+## 4. API Reference
 
-### Catalogue Service — `http://localhost:8080`
+### Catalogue Service: `http://localhost:8080`
 
-| Method | Path | Purpose | Caller | Success | Error |
-|--------|------|---------|--------|---------|-------|
-| `GET` | `/catalogue/items` | List all items | Client / Health check | `200` + JSON array | — |
-| `GET` | `/catalogue/items/{id}` | Fetch single item | Booking Service | `200` + JSON object | `404` if not found |
-| `PUT` | `/catalogue/items/{id}/reduce?quantity=N` | Atomically deduct stock | Booking Service (internal) | `200 "stock reduced"` | `400` insufficient · `404` missing |
+| Method | Path | Purpose | Caller | Success | Errors |
+|---|---|---|---|---|---|
+| `GET` | `/catalogue/items` | List all items | Client, health check | `200` JSON array | n/a |
+| `GET` | `/catalogue/items/{id}` | Fetch one item | Booking Service | `200` JSON object | `404` not found |
+| `PUT` | `/catalogue/items/{id}/reduce?quantity=N` | Atomically deduct stock | Booking Service (internal) | `200` `"stock reduced"` | `400` insufficient stock · `404` not found |
 
-### Booking Service — `http://localhost:8081`
+### Booking Service: `http://localhost:8081`
 
-| Method | Path | Purpose | Caller | Success | Error |
-|--------|------|---------|--------|---------|-------|
-| `POST` | `/booking` | Book an item | Client | `200 "item booked"` | `404 "item not found"` · `400 "number of items exceeded"` |
+| Method | Path | Purpose | Caller | Success | Errors |
+|---|---|---|---|---|---|
+| `POST` | `/booking` | Book an item | Client | `200` `"item booked"` | `400` invalid input or `"number of items exceeded"` · `404` `"item not found"` |
+
+**Example**
+
+```bash
+curl -X POST http://localhost:8081/booking \
+  -H "Content-Type: application/json" \
+  -d '{"itemId":"ITEM001","quantity":2}'
+# -> 200 item booked
+```
 
 ---
 
 ## 5. Startup Sequence
 
-Docker Compose enforces a strict startup order via a health check:
+Docker Compose enforces start order with a health check, so the Booking Service
+never starts before the Catalogue Service can answer requests.
 
-```
-Docker Compose
-     │
-     ├─①─▶  Start  catalogue-service  (port 8080)
-     │           │
-     │           │  Health probe: GET /catalogue/items
-     │           │  interval: 10s  ·  timeout: 5s  ·  retries: 5  ·  start_period: 20s
-     │           │
-     │           └─ ✅ HEALTHY  (Spring Boot ready; 3 seed items in store)
-     │
-     └─②─▶  Start  booking-service  (port 8081)
-                │
-                │  depends_on: catalogue-service (condition: service_healthy)
-                │
-                └─ ✅ READY  (RestTemplate wired; Docker DNS resolves catalogue-service)
+```mermaid
+sequenceDiagram
+    autonumber
+    participant DC as Docker Compose
+    participant CAT as catalogue-service
+    participant BOOK as booking-service
+
+    DC->>CAT: Start container (port 8080)
+    Note over CAT: Spring Boot boots, seeds 3 items
+    loop every 10s (timeout 5s, max 5 retries, after 20s start_period)
+        DC->>CAT: GET /catalogue/items
+        CAT-->>DC: 200 OK
+    end
+    Note over DC,CAT: Status = healthy
+    DC->>BOOK: Start container (depends_on: service_healthy)
+    Note over BOOK: RestTemplate wired,<br/>Docker DNS resolves catalogue-service
 ```
 
-> **Why this matters:** Without the health-check dependency, Booking Service could start before Catalogue Service is ready, producing `503 Service Unavailable` on the very first request.
+> **Why it matters:** without the health-check dependency, the first booking request
+> could hit a Catalogue Service that is still starting and fail with a connection
+> error or `503`.
 
 ---
 
 ## 6. Workflow Walkthroughs
 
+### Scenario A: Successful booking
+
+**Request:** `POST /booking` with `{ "itemId": "ITEM001", "quantity": 2 }`
+**Pre-condition:** ITEM001 (Wireless Headphones), `availableCount = 10`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant B as Booking Service
+    participant K as Catalogue Service
+
+    C->>B: POST /booking {ITEM001, qty 2}
+    Note over B: Validate: itemId not blank, qty > 0
+    B->>K: GET /catalogue/items/ITEM001
+    K-->>B: 200 {availableCount: 10}
+    Note over B: Pre-check: 2 <= 10 OK
+    B->>K: PUT /catalogue/items/ITEM001/reduce?quantity=2
+    Note over K: synchronized(item): check 10 >= 2, set count = 8
+    K-->>B: 200 "stock reduced"
+    B-->>C: 200 "item booked"
+```
+
+1. The client posts the booking request to port `8081`.
+2. `BookingController` validates the input; both checks pass.
+3. Booking Service fetches the item from the Catalogue Service over `app-net`.
+4. The response is deserialised into `CatalogueItem`; the requested quantity (2) does not exceed stock (10).
+5. Booking Service calls `PUT .../reduce?quantity=2`.
+6. `ItemRepository.reduceStock()` locks the `Item`, re-checks `10 >= 2`, and sets `availableCount = 8`.
+7. `200 "stock reduced"` returns to Booking Service, which replies `200 "item booked"`.
+
+Stock stays at 8 for the lifetime of the container.
+
+### Scenario B: Stock exceeded (short-circuit)
+
+**Request:** `POST /booking` with `{ "itemId": "ITEM002", "quantity": 99 }`
+**Pre-condition:** ITEM002 (Mechanical Keyboard), `availableCount = 5`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant B as Booking Service
+    participant K as Catalogue Service
+
+    C->>B: POST /booking {ITEM002, qty 99}
+    Note over B: Validate OK
+    B->>K: GET /catalogue/items/ITEM002
+    K-->>B: 200 {availableCount: 5}
+    Note over B: Pre-check: 99 > 5 FAIL
+    Note over B,K: No PUT is issued, stock untouched
+    B-->>C: 400 "number of items exceeded"
+```
+
+The Booking Service stops at the pre-check, so the Catalogue Service sees no write
+and ITEM002 stays at 5.
+
+### Scenario C: Item does not exist
+
+**Request:** `POST /booking` with `{ "itemId": "ITEM999", "quantity": 1 }`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant B as Booking Service
+    participant K as Catalogue Service
+
+    C->>B: POST /booking {ITEM999, qty 1}
+    B->>K: GET /catalogue/items/ITEM999
+    K-->>B: 404 Not Found
+    B-->>C: 404 "item not found"
+```
+
+### Scenario D: Concurrent bookings drain stock between check and deduct
+
+**Pre-condition:** ITEM003 has `availableCount = 1`; two clients each request 1 unit.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C1 as Client 1
+    actor C2 as Client 2
+    participant B as Booking Service
+    participant K as Catalogue Service
+
+    C1->>B: POST /booking {ITEM003, 1}
+    C2->>B: POST /booking {ITEM003, 1}
+    B->>K: GET ITEM003 (for C1)
+    B->>K: GET ITEM003 (for C2)
+    K-->>B: availableCount = 1
+    K-->>B: availableCount = 1
+    Note over B: Both pre-checks pass (optimistic read)
+    B->>K: PUT reduce qty=1 (C1)
+    Note over K: Lock acquired: 1 >= 1, count = 0
+    K-->>B: 200 "stock reduced"
+    B->>K: PUT reduce qty=1 (C2)
+    Note over K: Lock acquired: 0 < 1, rejected
+    K-->>B: 400 insufficient
+    B-->>C1: 200 "item booked"
+    B-->>C2: 400 "number of items exceeded"
+```
+
+The pre-check is only an optimistic early exit. The authoritative check is inside
+`reduceStock()`, so overselling cannot happen.
+
 ---
 
-### Scenario A — Successful Booking
+## 7. Concurrency and Thread-Safety Model
 
-> **Request:** `POST /booking`  `{ "itemId": "ITEM001", "quantity": 2 }`  
-> **Pre-condition:** ITEM001 (Wireless Headphones) — `availableCount = 10`
+The Catalogue Service uses two complementary levels.
 
-```
-Client                    Booking Service                Catalogue Service
-  │                             │                                │
-  │── POST /booking ───────────▶│                                │
-  │   { itemId:"ITEM001",       │                                │
-  │     quantity: 2 }           │                                │
-  │                             │                                │
-  │                        [Step 1] Validate input               │
-  │                        itemId  ≠ blank  ✅                   │
-  │                        quantity > 0     ✅                   │
-  │                             │                                │
-  │                        [Step 2] Check existence              │
-  │                             │── GET /catalogue/items/ ──────▶│
-  │                             │        ITEM001                 │
-  │                             │                         Look up ITEM001
-  │                             │                         ConcurrentHashMap → found ✅
-  │                             │                                │
-  │                             │◀── 200 { itemId:"ITEM001", ───│
-  │                             │    availableCount: 10 }        │
-  │                             │                                │
-  │                        [Step 3] Stock check                  │
-  │                        quantity (2) ≤ availableCount (10) ✅ │
-  │                             │                                │
-  │                        [Step 4] Deduct stock                 │
-  │                             │── PUT /catalogue/items/ ──────▶│
-  │                             │   ITEM001/reduce?quantity=2    │
-  │                             │                         synchronized(item) {
-  │                             │                           10 ≥ 2 ✅
-  │                             │                           availableCount = 8
-  │                             │                         }
-  │                             │◀── 200 "stock reduced" ────────│
-  │                             │                                │
-  │◀── 200 "item booked" ───────│                                │
-  │                             │                                │
+| Level | Mechanism | Effect |
+|---|---|---|
+| 1 | `ConcurrentHashMap` | Threads reading different (or the same) items never block each other |
+| 2 | `synchronized(item)` inside `reduceStock()` | The check-then-deduct pair runs atomically per item |
+
+**With the lock** (two concurrent bookings of 2 units, stock = 10):
+
+```mermaid
+sequenceDiagram
+    participant A as Thread A
+    participant I as Item ITEM001
+    participant B as Thread B
+
+    A->>I: acquire lock
+    Note over I: check 10 >= 2, set 8
+    A->>I: release lock
+    B->>I: acquire lock
+    Note over I: check 8 >= 2, set 6
+    B->>I: release lock
+    Note over I: Final = 6 (correct)
 ```
 
-**Step-by-step narration:**
+**Without the lock** (race condition): both threads read 10, both pass the check,
+both write 8. Final stock is 8 instead of 6, so one unit is given away.
 
-1. The client sends `POST http://localhost:8081/booking` with body `{ "itemId": "ITEM001", "quantity": 2 }`.
-2. `BookingController` validates that `itemId` is not blank and `quantity` is greater than zero — both conditions pass.
-3. Booking Service issues `GET http://catalogue-service:8080/catalogue/items/ITEM001` over the internal `app-net` Docker network.
-4. Catalogue Service's `ItemController` looks up `ITEM001` in the `ConcurrentHashMap` and finds it. It returns a JSON object including `availableCount: 10`.
-5. Booking Service deserialises the response into a `CatalogueItem` DTO and verifies that the requested quantity (2) does not exceed available stock (10) — it does not.
-6. Booking Service calls `PUT http://catalogue-service:8080/catalogue/items/ITEM001/reduce?quantity=2`.
-7. Catalogue Service's `ItemRepository.reduceStock()` enters a `synchronized` block on the `Item` object, confirms `10 >= 2`, then atomically sets `availableCount = 8`.
-8. Catalogue Service returns `200 "stock reduced"`.
-9. Booking Service returns `200 "item booked"` to the original client. Stock is now permanently 8 for the lifetime of the container.
+> **Key insight:** the Booking Service pre-check (step 3) is an *optimistic read*.
+> The race-safe check lives in `ItemRepository.reduceStock()`. That is why the
+> `PUT /reduce` call can still return `400` even after the pre-check passed, and
+> why the Booking Service must map that response to `400 "number of items exceeded"`.
 
----
-
-### Scenario B — Booking Fails (Stock Exceeded)
-
-> **Request:** `POST /booking`  `{ "itemId": "ITEM002", "quantity": 99 }`  
-> **Pre-condition:** ITEM002 (Mechanical Keyboard) — `availableCount = 5`
-
-```
-Client                    Booking Service                Catalogue Service
-  │                             │                                │
-  │── POST /booking ───────────▶│                                │
-  │   { itemId:"ITEM002",       │                                │
-  │     quantity: 99 }          │                                │
-  │                             │                                │
-  │                        [Step 1] Validate input               │
-  │                        itemId  ≠ blank  ✅                   │
-  │                        quantity > 0     ✅                   │
-  │                             │                                │
-  │                        [Step 2] Check existence              │
-  │                             │── GET /catalogue/items/ ──────▶│
-  │                             │        ITEM002                 │
-  │                             │                         Look up ITEM002
-  │                             │                         → found ✅
-  │                             │◀── 200 { itemId:"ITEM002", ───│
-  │                             │    availableCount: 5 }         │
-  │                             │                                │
-  │                        [Step 3] Stock check                  │
-  │                        quantity (99) > availableCount (5)    │
-  │                        ❌ FAIL — short-circuit               │
-  │                             │                                │
-  │                             │       (no PUT issued)          │
-  │                             │                                │
-  │◀── 400 "number of ─────────│                                │
-  │    items exceeded"          │                                │
-  │                             │                                │
-```
-
-**Step-by-step narration:**
-
-1. The client sends `POST http://localhost:8081/booking` with body `{ "itemId": "ITEM002", "quantity": 99 }`.
-2. `BookingController` validates input — `itemId` is non-blank, `quantity` is positive — both pass.
-3. Booking Service calls `GET http://catalogue-service:8080/catalogue/items/ITEM002` to verify the item exists and retrieve current stock.
-4. Catalogue Service finds ITEM002 and returns `{ availableCount: 5 }`.
-5. Booking Service compares: `99 > 5` — the requested quantity exceeds available stock.
-6. Booking Service **short-circuits immediately** — it never issues the `PUT /reduce` call. Stock is never touched.
-7. The client receives `400 Bad Request` with body `"number of items exceeded"`. ITEM002's stock remains at 5.
-
----
-
-## 7. Concurrency & Thread-Safety Model
-
-The Catalogue Service handles concurrent booking requests safely through a two-level strategy:
-
-```
-Level 1 — ConcurrentHashMap
-──────────────────────────────────────────────────────────────────
-  Multiple threads can read different items simultaneously
-  without blocking each other.
-
-  Thread-A reads ITEM001  ┐
-  Thread-B reads ITEM002  ┘  → both proceed concurrently ✅
-
-Level 2 — synchronized(item) block  [inside reduceStock()]
-──────────────────────────────────────────────────────────────────
-  The "check-then-deduct" pair is wrapped in a synchronized block
-  on the individual Item object.
-
-  Two concurrent bookings for ITEM001 (stock = 10, qty = 2 each):
-
-    Thread-A acquires lock on ITEM001
-      → checks 10 ≥ 2  ✅
-      → sets availableCount = 8
-      → releases lock
-    Thread-B acquires lock on ITEM001
-      → checks  8 ≥ 2  ✅
-      → sets availableCount = 6
-      → releases lock
-
-    Final: availableCount = 6  ✅  (correct)
-
-  Without synchronization (race condition):
-    Thread-A reads 10, Thread-B reads 10
-    Both see 10 ≥ 2, both deduct
-    Final: availableCount = 8  ❌  (oversell bug — one unit given away free)
-```
-
-> **Key insight:** Booking Service's pre-check (Step 3) is an **optimistic read**. The authoritative, race-safe check happens inside `ItemRepository.reduceStock()` on the Catalogue Service side. This is why Step 4 (`PUT /reduce`) can still return `400` if concurrent requests drain the stock between Steps 3 and 4.
+**Scope of the guarantee:** per-item locking is correct only for a single JVM and a
+single Catalogue replica, and only while the same `Item` instance stays in the map
+for the lifetime of the process.
 
 ---
 
 ## 8. Docker Build Pipeline
 
-Both services use identical **multi-stage Dockerfiles** to produce lean runtime images:
+Both services use identical multi-stage Dockerfiles.
 
-```
-Stage 1 — Builder  (maven:3.9.6-eclipse-temurin-17)
-────────────────────────────────────────────────────────────────────
-  ① COPY pom.xml  →  mvn dependency:go-offline  (layer-cached)
-  ② COPY src/     →  mvn compile  →  .class files
-  ③ mvn package   →  target/app.jar  (executable fat JAR, ~20 MB)
-                          │
-                          │  COPY --from=builder  (only the JAR)
-                          ▼
-Stage 2 — Runtime  (eclipse-temurin:17-jre-alpine)
-────────────────────────────────────────────────────────────────────
-  • Slim JRE only   — no Maven, no javac, no source code
-  • Final image:    ~86 MB compressed
-  • Runs as:        non-root user  (security best practice)
-  • Entrypoint:     java -jar app.jar
+```mermaid
+flowchart LR
+    subgraph s1["Stage 1: Builder (maven:3.9.6-eclipse-temurin-17)"]
+        direction TB
+        a["COPY pom.xml<br/>mvn dependency:go-offline<br/>(layer-cached)"] --> b["COPY src/"]
+        b --> c["mvn package<br/>-> target/app.jar (~20 MB fat JAR)"]
+    end
+    subgraph s2["Stage 2: Runtime (eclipse-temurin:17-jre-alpine)"]
+        direction TB
+        d["COPY --from=builder app.jar"] --> e["Run as non-root user"]
+        e --> f["ENTRYPOINT java -jar app.jar"]
+    end
+    c -->|"JAR only"| d
 ```
 
-| Image | Base | Approx. Size |
+The runtime image has no Maven, no `javac`, and no source code.
+
+| Image | Base | Approx. size (compressed) |
 |---|---|:---:|
 | `catalogue-service:latest` | `eclipse-temurin:17-jre-alpine` | ~86 MB |
 | `booking-service:latest` | `eclipse-temurin:17-jre-alpine` | ~86 MB |
 
 ---
 
-## 9. Design Decisions & Trade-offs
+## 9. Design Decisions and Trade-offs
 
-| Decision | Choice Made | Rationale | Trade-off |
+| Decision | Choice | Rationale | Trade-off |
 |---|---|---|---|
-| **Data store** | In-memory `ConcurrentHashMap` | Zero external dependencies; fast; simple to reason about | Data resets on container restart; not suitable for production persistence |
-| **Inter-service transport** | Synchronous HTTP REST via `RestTemplate` | Standard, language-agnostic; trivially testable with curl | Synchronous coupling — Catalogue unavailability blocks all bookings |
-| **Service discovery** | Docker DNS (container hostname) | Built into Docker Compose; no extra tooling (Consul, Eureka, etc.) | Only works inside the same Docker network; not portable to multi-host clusters |
-| **Startup ordering** | `depends_on` + health check probe | Prevents premature REST calls from Booking Service | Adds ~20 s to startup; not a substitute for circuit breakers in production |
-| **Concurrency control** | `synchronized` on individual item object | Fine-grained locking per item; prevents overselling without a DB transaction | Blocking; would not scale beyond a single JVM / single replica |
-| **Build strategy** | Multi-stage Docker build | No local JDK or Maven required on the host; final image is lean and secure | Slightly longer first build (Maven dependency download, cached on subsequent rebuilds) |
+| **Data store** | In-memory `ConcurrentHashMap` | No external dependencies; fast; easy to reason about | Data resets on restart; not suitable for production persistence |
+| **Inter-service transport** | Synchronous REST via `RestTemplate` | Standard, language-agnostic, trivially testable with curl | Temporal coupling: Catalogue downtime blocks all bookings |
+| **Service discovery** | Docker DNS | Built into Compose; no Consul or Eureka needed | Single Docker network only; not portable to multi-host clusters |
+| **Startup ordering** | `depends_on` + health check | Prevents premature calls from Booking Service | Adds ~20 s to startup; not a substitute for retries or circuit breakers |
+| **Concurrency control** | `synchronized` on the item object | Fine-grained per-item locking; prevents overselling without DB transactions | Blocking; valid for one JVM and one replica only |
+| **Build strategy** | Multi-stage Docker build | No local JDK or Maven needed; lean, secure runtime image | Slower first build (dependency download), cached afterwards |
 
 ---
 
-*Document maintained alongside source code. Last reviewed: 2026-10-15.*
+## 10. Known Limitations and Next Steps
+
+| # | Limitation | Suggested improvement |
+|---|---|---|
+| 1 | `PUT /reduce` is an internal operation but is reachable from the host because port `8080` is published. Any client can deplete stock without going through booking. | Remove the host port mapping for `catalogue-service` (or restrict to `127.0.0.1`), or expose only `GET` routes publicly. |
+| 2 | The pre-check (`GET` then compare) duplicates the authoritative check and adds a network round trip. | Keep `GET` only for the `404` distinction and let `reduce` decide stock sufficiency, or drop the quantity pre-check. |
+| 3 | `RestTemplate` has no explicit connect/read timeouts, retries, or circuit breaker. A slow Catalogue Service can exhaust Booking threads. | Configure timeouts on the `RestTemplate` bean; add Resilience4j if the system grows. |
+| 4 | Booking is not idempotent. A client retry after a timeout can deduct stock twice. | Accept an idempotency key on `POST /booking`. |
+| 5 | `PUT /reduce` is a state change on a non-idempotent verb with query parameters. | Prefer `POST /catalogue/items/{id}/reservations` with a body if the API is to be public. |
+| 6 | State is lost on restart and cannot be shared across replicas. | Move to a database with conditional updates (`UPDATE ... WHERE available_count >= ?`) to replace the JVM lock. |
+
+---
+
+*Maintained alongside the source code. Update this document whenever endpoints, ports, or the Compose topology change.*
